@@ -1,0 +1,433 @@
+/*******************************************************************
+ * File:        module
+ * Purpose:     Joystick module - provides Joystick_Read SWI (&43F40)
+ *              Supports reason code 0 (8-bit state, RISC OS 3+) and
+ *              reason code 1 (16-bit state, RISC OS 3.6+).
+ * Author:      RISC OS Open
+ ******************************************************************/
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+#include "modhead.h"
+
+
+/* -----------------------------------------------------------------------
+ * Hardware register definitions
+ * The Archimedes and RiscPC use an IOC/IOMD-connected ADC (ZN449) to
+ * sample the analogue joystick axes.  Addresses given here are for the
+ * standard Archimedes IOC peripheral space; adjust for the target board.
+ * ----------------------------------------------------------------------- */
+
+/* IOC ADC base address (logical, after MMU mapping) */
+#define ADC_BASE            ((volatile unsigned int *)0x03350000)
+
+/* ADC conversion-start register: write channel number (0-3) to trigger */
+#define ADC_CONVERT_REG     (ADC_BASE + 0)
+
+/* ADC result registers (one per channel, 8-bit result in bits 0-7) */
+#define ADC_RESULT_X1       (ADC_BASE + 1)  /* Joystick 0 X axis */
+#define ADC_RESULT_Y1       (ADC_BASE + 2)  /* Joystick 0 Y axis */
+#define ADC_RESULT_X2       (ADC_BASE + 3)  /* Joystick 1 X axis */
+#define ADC_RESULT_Y2       (ADC_BASE + 4)  /* Joystick 1 Y axis */
+
+/* IOC parallel port data register - bits 0-3 carry the fire buttons */
+#define IOC_PARALLEL_BASE   ((volatile unsigned int *)0x03310000)
+#define IOC_SWITCHES_REG    (IOC_PARALLEL_BASE + 0)
+
+/* Bit masks for switch lines in the parallel port register */
+#define SWITCH_FIRE1_BIT    (1u << 0)   /* Joystick 0, button 1 */
+#define SWITCH_FIRE2_BIT    (1u << 1)   /* Joystick 0, button 2 */
+#define SWITCH_FIRE3_BIT    (1u << 2)   /* Joystick 1, button 1 */
+#define SWITCH_FIRE4_BIT    (1u << 3)   /* Joystick 1, button 2 */
+
+/* Maximum number of joystick ports handled by this module */
+#define JOYSTICK_MAX        2
+
+/* Midpoint of an 8-bit ADC result (range 0-255) */
+#define ADC_MIDPOINT        128
+
+/* Scale factor: ADC range is 0-255, reported range is -127..127 */
+#define ADC_SCALE_8         127
+
+/* Scale factor for 16-bit report: ADC range 0-255 maps to 0..65535 */
+#define ADC_SCALE_16        257
+
+
+/* -----------------------------------------------------------------------
+ * Error definitions
+ * ----------------------------------------------------------------------- */
+
+/* "Bad reason code" error - returned for unknown reason codes */
+static _kernel_oserror err_bad_reason = { 0x000121, "Bad reason code" };
+
+/* "Bad joystick number" error - joystick number out of range */
+static _kernel_oserror err_bad_joystick = { 0x000122, "Bad joystick number" };
+
+
+/* -----------------------------------------------------------------------
+ * Module state
+ * ----------------------------------------------------------------------- */
+
+/* Flag: has the first call been made?  The PRM states that conversions are
+ * not started until the first Joystick_Read call, and that first call always
+ * returns X=0, Y=0, no switches. */
+static int conversions_started = 0;
+
+/* Private word pointer, saved at initialisation for use by callbacks */
+static void *module_pw = NULL;
+
+
+/* -----------------------------------------------------------------------
+ * Forward declarations
+ * ----------------------------------------------------------------------- */
+
+static _kernel_oserror *joystick_read_8bit(int joystick, int *result_out);
+static _kernel_oserror *joystick_read_16bit(int joystick, int *result_out);
+static void             hardware_start_conversion(int joystick);
+static unsigned int     hardware_read_x(int joystick);
+static unsigned int     hardware_read_y(int joystick);
+static unsigned int     hardware_read_switches(int joystick);
+
+
+/* -----------------------------------------------------------------------
+ * Module initialisation and finalisation
+ * ----------------------------------------------------------------------- */
+
+/***************************************************************************
+ * Function:     Mod_Init
+ * Description:  Initialise the module.  Sets up the ADC hardware ready for
+ *               joystick sampling; no conversion is started here - that is
+ *               deferred until the first Joystick_Read call, per the PRM.
+ * Parameters:   tail        = pointer to command line (control terminated)
+ *               podule_base = address of podule module was started from, or
+ *                             NULL if none
+ *               pw          = private word for module
+ * On exit:      NULL on success, or pointer to error block on failure.
+ **************************************************************************/
+_kernel_oserror *Mod_Init(const char *tail, int podule_base, void *pw)
+{
+    module_pw = pw;
+    conversions_started = 0;
+
+    /* No hardware configuration needed at init; the ADC is started on the
+     * first call to Joystick_Read as documented in the RISC OS PRM. */
+
+    return NULL;
+}
+
+
+/***************************************************************************
+ * Function:     Mod_Final
+ * Description:  Finalise the module.  Stops any in-progress ADC conversions
+ *               and releases hardware resources.
+ * Parameters:   fatal       = 1 if fatal, 0 if reinitialising
+ *               podule_base = address of podule module was started from, or
+ *                             NULL if none
+ *               pw          = private word for module
+ * On exit:      NULL on success, or pointer to error block on failure.
+ **************************************************************************/
+_kernel_oserror *Mod_Final(int fatal, int podule_base, void *pw)
+{
+    /* Stop ongoing ADC conversions so the hardware is left quiescent */
+    /* STUB: write a 'stop' value to ADC_CONVERT_REG if the hardware
+     *       requires an explicit halt sequence. */
+
+    conversions_started = 0;
+    module_pw = NULL;
+
+    return NULL;
+}
+
+
+/* -----------------------------------------------------------------------
+ * SWI handler
+ * ----------------------------------------------------------------------- */
+
+/***************************************************************************
+ * Function:     Mod_SWI
+ * Description:  SWI handler for all Joystick SWIs.  Only SWI offset 0
+ *               (Joystick_Read, &43F40) is defined; all others return an
+ *               error.
+ * Parameters:   swi_no = SWI offset within this module's chunk (0 = Read)
+ *               r      = pointer to register block on entry/exit
+ *               pw     = private word for module
+ * On exit:      NULL on success, or pointer to error block on failure.
+ **************************************************************************/
+_kernel_oserror *Mod_SWI(int swi_no, _kernel_swi_regs *r, void *pw)
+{
+    int joystick;
+    int reason;
+    int result;
+    _kernel_oserror *err;
+
+    switch (swi_no)
+    {
+        case 0: /* Joystick_Read (&43F40) */
+            joystick = r->r[0] & 0xFF;          /* bits 0-7:  joystick number */
+            reason   = (r->r[0] >> 8) & 0xFF;   /* bits 8-15: reason code     */
+
+            if (joystick >= JOYSTICK_MAX)
+                return &err_bad_joystick;
+
+            switch (reason)
+            {
+                case 0:
+                    err = joystick_read_8bit(joystick, &result);
+                    break;
+
+                case 1:
+                    err = joystick_read_16bit(joystick, &result);
+                    break;
+
+                default:
+                    return &err_bad_reason;
+            }
+
+            if (err != NULL)
+                return err;
+
+            r->r[0] = result;
+            return NULL;
+
+        default:
+            return (_kernel_oserror *)-1; /* SWI not known */
+    }
+}
+
+
+/* -----------------------------------------------------------------------
+ * Joystick reading functions
+ * ----------------------------------------------------------------------- */
+
+/***************************************************************************
+ * Function:     joystick_read_8bit
+ * Description:  Reads the 8-bit state of the requested joystick, as defined
+ *               by Joystick_Read reason 0 (RISC OS 3+).
+ *
+ *               Return value layout:
+ *                 bits  0- 7  signed Y, -127 (down) to 127 (up)
+ *                 bits  8-15  signed X, -127 (left) to 127 (right)
+ *                 bits 16-23  switch/fire-button states, 1 = pressed
+ *                 bits 24-31  reserved (zero)
+ *
+ * Parameters:   joystick   = joystick index (0 or 1)
+ *               result_out = receives the packed result word
+ * On exit:      NULL on success.
+ **************************************************************************/
+static _kernel_oserror *joystick_read_8bit(int joystick, int *result_out)
+{
+    unsigned int raw_x;
+    unsigned int raw_y;
+    unsigned int switches;
+    int          scaled_x;
+    int          scaled_y;
+
+    /* Per the PRM: the first call starts conversions and returns 0,0,0. */
+    if (!conversions_started)
+    {
+        conversions_started = 1;
+        hardware_start_conversion(joystick);
+        *result_out = 0;
+        return NULL;
+    }
+
+    /* Read the most recent ADC conversion results for this joystick */
+    raw_x    = hardware_read_x(joystick);       /* 0-255 */
+    raw_y    = hardware_read_y(joystick);       /* 0-255 */
+    switches = hardware_read_switches(joystick);
+
+    /* Trigger the next conversion so it will be ready for the following
+     * call (the ADC result register holds the previous conversion) */
+    hardware_start_conversion(joystick);
+
+    /* Convert 0-255 ADC range to -127..127 signed range.
+     * ADC midpoint (128) maps to 0; 0 maps to -127; 255 maps to ~127. */
+    scaled_x = ((int)raw_x - ADC_MIDPOINT) * ADC_SCALE_8 / ADC_MIDPOINT;
+    scaled_y = ((int)raw_y - ADC_MIDPOINT) * ADC_SCALE_8 / ADC_MIDPOINT;
+
+    /* Clamp to valid range */
+    if (scaled_x >  127) scaled_x =  127;
+    if (scaled_x < -127) scaled_x = -127;
+    if (scaled_y >  127) scaled_y =  127;
+    if (scaled_y < -127) scaled_y = -127;
+
+    /* Pack result: Y in bits 0-7, X in bits 8-15, switches in bits 16-23 */
+    *result_out = ((scaled_y & 0xFF))
+                | ((scaled_x & 0xFF) << 8)
+                | ((switches & 0xFF) << 16);
+
+    return NULL;
+}
+
+
+/***************************************************************************
+ * Function:     joystick_read_16bit
+ * Description:  Reads the 16-bit state of the requested joystick, as
+ *               defined by Joystick_Read reason 1 (RISC OS 3.6+).
+ *
+ *               Return value layout:
+ *                 bits  0-15  Y position, 0 (down) to 65535 (up)
+ *                 bits 16-31  X position, 0 (left) to 65535 (right)
+ *
+ * Parameters:   joystick   = joystick index (0 or 1)
+ *               result_out = receives the packed result word
+ * On exit:      NULL on success.
+ **************************************************************************/
+static _kernel_oserror *joystick_read_16bit(int joystick, int *result_out)
+{
+    unsigned int raw_x;
+    unsigned int raw_y;
+    unsigned int scaled_x;
+    unsigned int scaled_y;
+
+    /* Per the PRM: the first call starts conversions and returns 0,0. */
+    if (!conversions_started)
+    {
+        conversions_started = 1;
+        hardware_start_conversion(joystick);
+        *result_out = 0;
+        return NULL;
+    }
+
+    /* Read the most recent ADC conversion results for this joystick */
+    raw_x = hardware_read_x(joystick);   /* 0-255 */
+    raw_y = hardware_read_y(joystick);   /* 0-255 */
+
+    /* Trigger the next conversion so it will be ready for the following call */
+    hardware_start_conversion(joystick);
+
+    /* Scale 0-255 to 0-65535.  Multiply by 257 (= 65535/255). */
+    scaled_x = raw_x * ADC_SCALE_16;
+    scaled_y = raw_y * ADC_SCALE_16;
+
+    /* Pack result: Y in bits 0-15, X in bits 16-31 */
+    *result_out = (int)((scaled_y & 0xFFFF) | ((scaled_x & 0xFFFF) << 16));
+
+    return NULL;
+}
+
+
+/* -----------------------------------------------------------------------
+ * Hardware stub functions
+ * These functions encapsulate direct hardware access.  Replace the body
+ * of each with the appropriate register reads/writes for the target
+ * platform.
+ * ----------------------------------------------------------------------- */
+
+/***************************************************************************
+ * Function:     hardware_start_conversion
+ * Description:  Initiates an ADC conversion for both axes of the requested
+ *               joystick.  The result will be available in the ADC result
+ *               registers after the conversion completes (typically a few
+ *               microseconds on Archimedes hardware).
+ * Parameters:   joystick = joystick index (0 or 1)
+ **************************************************************************/
+static void hardware_start_conversion(int joystick)
+{
+    /* STUB: write channel selectors to ADC_CONVERT_REG to begin sampling.
+     *
+     * On Archimedes hardware (ZN449 ADC via IOC):
+     *   - Channel 0 = joystick 0 X axis
+     *   - Channel 1 = joystick 0 Y axis
+     *   - Channel 2 = joystick 1 X axis
+     *   - Channel 3 = joystick 1 Y axis
+     *
+     * Example (replace with correct protocol for the target ADC):
+     *
+     *   int x_channel = joystick * 2;
+     *   int y_channel = joystick * 2 + 1;
+     *   *ADC_CONVERT_REG = (unsigned int)x_channel;
+     *   (void)joystick; (void)x_channel; (void)y_channel;
+     */
+    (void)joystick;
+}
+
+
+/***************************************************************************
+ * Function:     hardware_read_x
+ * Description:  Reads the most recently completed ADC conversion for the
+ *               X axis of the requested joystick.
+ * Parameters:   joystick = joystick index (0 or 1)
+ * Returns:      Raw ADC value in the range 0-255 (8-bit result).
+ *               Returns 128 (midpoint/neutral) as a stub.
+ **************************************************************************/
+static unsigned int hardware_read_x(int joystick)
+{
+    /* STUB: read the ADC result register for the X axis channel.
+     *
+     * Example (replace with correct register for the target platform):
+     *
+     *   if (joystick == 0)
+     *       return *ADC_RESULT_X1 & 0xFF;
+     *   else
+     *       return *ADC_RESULT_X2 & 0xFF;
+     */
+    (void)joystick;
+    return ADC_MIDPOINT; /* stub: return neutral position */
+}
+
+
+/***************************************************************************
+ * Function:     hardware_read_y
+ * Description:  Reads the most recently completed ADC conversion for the
+ *               Y axis of the requested joystick.
+ * Parameters:   joystick = joystick index (0 or 1)
+ * Returns:      Raw ADC value in the range 0-255 (8-bit result).
+ *               Returns 128 (midpoint/neutral) as a stub.
+ **************************************************************************/
+static unsigned int hardware_read_y(int joystick)
+{
+    /* STUB: read the ADC result register for the Y axis channel.
+     *
+     * Example (replace with correct register for the target platform):
+     *
+     *   if (joystick == 0)
+     *       return *ADC_RESULT_Y1 & 0xFF;
+     *   else
+     *       return *ADC_RESULT_Y2 & 0xFF;
+     */
+    (void)joystick;
+    return ADC_MIDPOINT; /* stub: return neutral position */
+}
+
+
+/***************************************************************************
+ * Function:     hardware_read_switches
+ * Description:  Reads the fire-button / switch states for the requested
+ *               joystick from the parallel port input register.
+ * Parameters:   joystick = joystick index (0 or 1)
+ * Returns:      Packed switch byte: bit 0 = button 1, bit 1 = button 2.
+ *               A set bit means the button is pressed.
+ *               Returns 0 (no buttons pressed) as a stub.
+ **************************************************************************/
+static unsigned int hardware_read_switches(int joystick)
+{
+    /* STUB: read the IOC parallel port register and extract the fire-button
+     * bits for the requested joystick.
+     *
+     * On Archimedes hardware, fire buttons are active-low inputs on the
+     * parallel port data register.  Invert before returning.
+     *
+     * Example (replace with correct register and bit positions):
+     *
+     *   unsigned int port = *IOC_SWITCHES_REG;
+     *   unsigned int result = 0;
+     *
+     *   if (joystick == 0)
+     *   {
+     *       if (!(port & SWITCH_FIRE1_BIT)) result |= (1u << 0);
+     *       if (!(port & SWITCH_FIRE2_BIT)) result |= (1u << 1);
+     *   }
+     *   else
+     *   {
+     *       if (!(port & SWITCH_FIRE3_BIT)) result |= (1u << 0);
+     *       if (!(port & SWITCH_FIRE4_BIT)) result |= (1u << 1);
+     *   }
+     *   return result;
+     */
+    (void)joystick;
+    return 0; /* stub: no buttons pressed */
+}
